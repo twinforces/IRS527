@@ -4,8 +4,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rapidfuzz import process, fuzz
 from tqdm import tqdm
+import time
+import queue
 
-# Define headers for each record type based on IRS 527 documentation
+# Constants
+THRESHOLD = 60  # Fuzzy match score threshold
+
+# Define headers for each record type
 headers = {
     "H": ["record_type", "file_date", "version", "flag"],
     "1": ["record_type", "form_id_number", "initial_or_amended", "organization_type", "filing_date", "amended_date",
@@ -37,14 +42,14 @@ headers = {
     "B": ["record_type", "form_id_number", "schedule_id_number", "organization_name", "organization_ein", "recipient_name",
           "recipient_address_line_1", "recipient_address_line_2", "recipient_city", "recipient_state", "recipient_zip_code",
           "recipient_zip_ext", "recipient_employer", "expenditure_amount", "recipient_occupation", "expenditure_date",
-          "expenditure_purpose", "fuzzy_match_score"],  # Added new column
+          "expenditure_purpose", "fuzzy_match_score"],
     "F": ["record_type", "file_date", "version"]
 }
 
-# Keywords for identifying transfers in expenditure purpose
+# Keywords for identifying transfers
 transfer_keywords = ["contribution", "donation", "transfer", "political contribution"]
 
-# Initialize statistics
+# Initialize statistics with lock for thread safety
 stats = {
     "total_contributions": 0,
     "contribution_count": 0,
@@ -56,16 +61,16 @@ stats = {
     "expenditure_count_by_purpose": defaultdict(int),
     "exceptions": {"A": 0, "B": 0}
 }
+stats_lock = threading.Lock()
 
-# Cache for fuzzy matching results
+# Cache and histogram
 fuzzy_cache = {}
-
-# Histogram for fuzzy match scores
 histogram = defaultdict(int)
 histogram_lock = threading.Lock()
 
-# Lock for writing to 'B' output file
-b_write_lock = threading.Lock()
+# Queue for batched 'B' records
+b_record_queue = queue.Queue(maxsize=1000)
+write_lock = threading.Lock()
 
 # Open output files and write headers
 output_files = {}
@@ -78,28 +83,29 @@ for record_type in headers:
 exception_log = open("exception_log.txt", "w")
 exception_log.write("Exception Log for Non-Numeric Amount Values\n\n")
 
-# Specify the input file
-input_file = "FullDataFile.txt"  # Fixed file name without leading space
+# Input file
+input_file = "FullDataFile.txt"
 
-# First Pass: Collect PAC names from '1' records with progress bar
+# First Pass: Collect PAC names with progress bar
 pac_names = set()
+start_time = time.time()
 with open(input_file, "r") as infile:
-    # Count total lines for progress bar (optional, can be omitted if file size is unknown)
     total_lines = sum(1 for _ in infile)
     infile.seek(0)
     for line in tqdm(infile, total=total_lines, desc="First Pass: Collecting PAC Names"):
         fields = line.strip().split("|")
         if fields and fields[0] == "1" and len(fields) > 7:
-            organization_name = fields[7].lower()  # Organization name at index 7
+            organization_name = fields[7].lower()
             pac_names.add(organization_name)
+print(f"First Pass completed in {time.time() - start_time:.2f} seconds")
 
-# Function to process 'B' records with fuzzy matching
+# Function to process 'B' records
 def process_b_record(line):
     fields = line.strip().split("|")
-    if len(fields) < 14:
-        return  # Skip malformed records
+    if len(fields) < 14:  # Minimum fields for 'B' records
+        return
 
-    # Adjust fields to match header length
+    # Adjust fields to match header
     expected_fields = len(headers["B"])
     if len(fields) < expected_fields:
         fields += [""] * (expected_fields - len(fields))
@@ -111,11 +117,12 @@ def process_b_record(line):
     amount_str = fields[13] if len(fields) > 13 else ""
 
     try:
-        amount = float(amount_str)
-        stats["total_expenditures"] += amount
-        stats["expenditure_count"] += 1
-        stats["expenditure_by_purpose"][purpose] += amount
-        stats["expenditure_count_by_purpose"][purpose] += 1
+        amount = float(amount_str or 0) if amount_str else 0
+        with stats_lock:
+            stats["total_expenditures"] += amount
+            stats["expenditure_count"] += 1
+            stats["expenditure_by_purpose"][purpose] += amount
+            stats["expenditure_count_by_purpose"][purpose] += 1
 
         if recipient_name:
             if recipient_name in fuzzy_cache:
@@ -128,60 +135,102 @@ def process_b_record(line):
                     match, score = None, 0
                 fuzzy_cache[recipient_name] = (match, score)
 
-            if match:
-                # Update histogram
-                with histogram_lock:
-                    bin_key = (score // 10 * 10)
-                    histogram[bin_key] += 1
-                fields[-1] = str(score)  # Add score to fields
-                if score >= 90 and any(keyword in purpose for keyword in transfer_keywords):
+            fields[-1] = str(score)  # Add fuzzy match score
+            with histogram_lock:
+                bin_key = (score // 10 * 10)
+                histogram[bin_key] += 1
+            if match and score >= THRESHOLD and any(keyword in purpose for keyword in transfer_keywords):
+                with stats_lock:
                     stats["total_pac_to_pac"] += amount
                     stats["pac_to_pac_count"] += 1
-            else:
-                fields[-1] = "0"
-        else:
-            fields[-1] = "0"
 
     except (ValueError, TypeError):
-        stats["exceptions"]["B"] += 1
+        with stats_lock:
+            stats["exceptions"]["B"] += 1
         exception_log.write(f"Record B Exception (Amount: {amount_str}): {line}\n")
-        fields[-1] = "0"
 
-    # Write to 'B' output file with lock
-    with b_write_lock:
-        output_files["B"].write("|".join(fields) + "\n")
+    # Add to queue for batched writing
+    b_record_queue.put(fields)
 
-# Second Pass: Process all records with multithreading for 'B' records and progress bar
+# Function to write batched 'B' records
+def write_b_records():
+    batch = []
+    while True:
+        try:
+            batch.append(b_record_queue.get(timeout=1))  # Timeout to allow queue check
+            if len(batch) >= 1000 or b_record_queue.empty():
+                with write_lock:
+                    for fields in batch:
+                        output_files["B"].write("|".join(fields) + "\n")
+                batch = []
+        except queue.Empty:
+            if batch:
+                with write_lock:
+                    for fields in batch:
+                        output_files["B"].write("|".join(fields) + "\n")
+            break
+
+# Second Pass: Process all records with multithreading
+start_time = time.time()
 with ThreadPoolExecutor(max_workers=8) as executor:
     futures = []
+    write_future = executor.submit(write_b_records)  # Separate thread for writing
     with open(input_file, "r") as infile:
+        total_lines = sum(1 for _ in infile)
+        infile.seek(0)
+        processed_lines = 0
         for line in tqdm(infile, total=total_lines, desc="Second Pass: Processing Records"):
             fields = line.strip().split("|")
             if not fields or not fields[0]:
+                processed_lines += 1
                 continue
             record_type = fields[0]
-            if record_type == "B":
-                # Submit 'B' record processing to thread pool
-                future = executor.submit(process_b_record, line)
-                futures.append(future)
-            else:
-                # Write non-'B' records immediately
-                if record_type in output_files:
+            if record_type in output_files:
+                if record_type == "A":
+                    amount_str = fields[13] if len(fields) > 13 else ""
+                    try:
+                        amount = float(amount_str) if amount_str else 0
+                        with stats_lock:
+                            stats["total_contributions"] += amount
+                            stats["contribution_count"] += 1
+                    except (ValueError, TypeError):
+                        with stats_lock:
+                            stats["exceptions"]["A"] += 1
+                        exception_log.write(f"Record A Exception (Amount: {amount_str}): {line}\n")
                     output_files[record_type].write(line)
+                    processed_lines += 1
+                elif record_type == "B":
+                    future = executor.submit(process_b_record, line)
+                    futures.append(future)
+                    processed_lines += 1
+                else:
+                    output_files[record_type].write(line)
+                    processed_lines += 1
+            else:
+                processed_lines += 1
 
     # Wait for all 'B' record tasks to complete
     for future in as_completed(futures):
-        future.result()  # Ensure all tasks are done
+        try:
+            future.result(timeout=30)
+        except Exception as e:
+            print(f"Thread error or timeout: {e}")
+
+    # Signal writer to finish
+    b_record_queue.put(None)  # Sentinel value to stop writer
+    write_future.result()  # Wait for writer to complete
+
+print(f"Second Pass completed in {time.time() - start_time:.2f} seconds")
 
 # Close all output files and exception log
 for file in output_files.values():
     file.close()
 exception_log.close()
 
-# Compute top-5 and bottom-5 purposes by total expenditure
-sorted_purposes = sorted(stats["expenditure_by_purpose"].items(), key=lambda x: x[1], reverse=True)
+# Compute top-5 and bottom-5 purposes by absolute value
+sorted_purposes = sorted(stats["expenditure_by_purpose"].items(), key=lambda x: abs(x[1]), reverse=True)
 top_5 = sorted_purposes[:5]
-bottom_5 = sorted_purposes[-5:] if len(sorted_purposes) >= 5 else sorted_purposes[::-1]
+bottom_5 = sorted_purposes[-5:] if len(sorted_purposes) >= 5 else sorted_purposes[:5]
 
 # Output statistics in Markdown
 print("\n# IRS 527 Data Statistics\n")
@@ -197,24 +246,24 @@ print(f"- **Number of Expenditures**: {stats['expenditure_count']:,}")
 print(f"- **Expenditure Exceptions**: {stats['exceptions']['B']:,}")
 
 print("\n## PAC-to-PAC Transfers (Approximated)\n")
-print(f"- **Total PAC-to-PAC Transfers**: ${stats['total_pac_to_pac']:,.2f} (based on fuzzy matching with score >= 90 and purpose keywords)")
+print(f"- **Total PAC-to-PAC Transfers**: ${stats['total_pac_to_pac']:,.2f} (based on fuzzy matching with score >= {THRESHOLD} and purpose keywords)")
 print(f"- **Number of PAC-to-PAC Transfers**: {stats['pac_to_pac_count']:,}")
 
-print("\n## Top-5 Purposes by Total Expenditure\n")
+print("\n## Top-5 Purposes by Absolute Expenditure\n")
 print("| Purpose | Total Expenditure | Count | Average Expenditure |")
 print("|---------|-------------------|-------|--------------------|")
 for purpose, total in top_5:
     count = stats["expenditure_count_by_purpose"][purpose]
-    avg = total / count if count > 0 else 0
-    print(f"| {purpose} | ${total:,.2f} | {count:,} | ${avg:,.2f} |")
+    avg = abs(total) / count if count > 0 else 0
+    print(f"| {purpose} | ${abs(total):,.2f} | {count:,} | ${avg:,.2f} |")
 
-print("\n## Bottom-5 Purposes by Total Expenditure\n")
+print("\n## Bottom-5 Purposes by Absolute Expenditure\n")
 print("| Purpose | Total Expenditure | Count | Average Expenditure |")
 print("|---------|-------------------|-------|--------------------|")
 for purpose, total in bottom_5:
     count = stats["expenditure_count_by_purpose"][purpose]
-    avg = total / count if count > 0 else 0
-    print(f"| {purpose} | ${total:,.2f} | {count:,} | ${avg:,.2f} |")
+    avg = abs(total) / count if count > 0 else 0
+    print(f"| {purpose} | ${abs(total):,.2f} | {count:,} | ${avg:,.2f} |")
 
 print("\n## Fuzzy Match Score Histogram\n")
 print("| Score Range | Count |")
@@ -224,5 +273,6 @@ for bin_key in range(0, 101, 10):
     range_str = f"{bin_key}-{min(bin_key + 9, 100)}" if bin_key < 100 else "100"
     print(f"| {range_str} | {count} |")
 
+print(f"Total execution time: {time.time() - start_time:.2f} seconds")
 print("\nProcessing complete. Output files created for each record type.")
 print("Exception log created: exception_log.txt")
