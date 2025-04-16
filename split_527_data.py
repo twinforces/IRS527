@@ -152,7 +152,7 @@ def process_b_record(line):
         output_files["B"].write("|".join(fields) + "\n")
 
 # Second Pass: Process all records with multithreading for 'B' records and progress bar
-with ThreadPoolExecutor(max_workers=4) as executor:
+with ThreadPoolExecutor(max_workers=8) as executor:
     futures = []
     with open(input_file, "r") as infile:
         for line in tqdm(infile, total=total_lines, desc="Second Pass: Processing Records"):
