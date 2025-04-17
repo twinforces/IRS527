@@ -71,6 +71,7 @@ histogram_lock = threading.Lock()
 # Queue for batched 'B' records
 b_record_queue = queue.Queue(maxsize=1000)
 write_lock = threading.Lock()
+writer_should_stop = False
 
 # Open output files and write headers
 output_files = {}
@@ -89,6 +90,7 @@ input_file = "FullDataFile.txt"
 # First Pass: Collect PAC names with progress bar
 pac_names = set()
 start_time = time.time()
+print(f"Starting First Pass at {time.strftime('%H:%M:%S')}")
 with open(input_file, "r") as infile:
     total_lines = sum(1 for _ in infile)
     infile.seek(0)
@@ -97,7 +99,7 @@ with open(input_file, "r") as infile:
         if fields and fields[0] == "1" and len(fields) > 7:
             organization_name = fields[7].lower()
             pac_names.add(organization_name)
-print(f"First Pass completed in {time.time() - start_time:.2f} seconds")
+print(f"First Pass completed at {time.strftime('%H:%M:%S')}, took {time.time() - start_time:.2f} seconds")
 
 # Function to process 'B' records
 def process_b_record(line):
@@ -155,10 +157,13 @@ def process_b_record(line):
 # Function to write batched 'B' records
 def write_b_records():
     batch = []
-    while True:
+    while not writer_should_stop or not b_record_queue.empty():
         try:
-            batch.append(b_record_queue.get(timeout=1))  # Timeout to allow queue check
-            if len(batch) >= 1000 or b_record_queue.empty():
+            item = b_record_queue.get(timeout=1)
+            if item is None:  # Sentinel to stop
+                break
+            batch.append(item)
+            if len(batch) >= 1000:
                 with write_lock:
                     for fields in batch:
                         output_files["B"].write("|".join(fields) + "\n")
@@ -168,13 +173,20 @@ def write_b_records():
                 with write_lock:
                     for fields in batch:
                         output_files["B"].write("|".join(fields) + "\n")
-            break
+                batch = []
+    # Final flush
+    if batch:
+        with write_lock:
+            for fields in batch:
+                output_files["B"].write("|".join(fields) + "\n")
 
 # Second Pass: Process all records with multithreading
 start_time = time.time()
+print(f"Starting Second Pass at {time.strftime('%H:%M:%S')}")
+writer_thread = threading.Thread(target=write_b_records)
+writer_thread.start()
 with ThreadPoolExecutor(max_workers=8) as executor:
     futures = []
-    write_future = executor.submit(write_b_records)  # Separate thread for writing
     with open(input_file, "r") as infile:
         total_lines = sum(1 for _ in infile)
         infile.seek(0)
@@ -210,24 +222,33 @@ with ThreadPoolExecutor(max_workers=8) as executor:
                 processed_lines += 1
 
     # Wait for all 'B' record tasks to complete
+    wait_start = time.time()
+    print(f"Starting thread wait at {time.strftime('%H:%M:%S')}")
     for future in as_completed(futures):
         try:
             future.result(timeout=30)
         except Exception as e:
-            print(f"Thread error or timeout: {e}")
+            print(f"Thread error or timeout at {time.strftime('%H:%M:%S')}: {e}")
+    print(f"Thread wait completed at {time.strftime('%H:%M:%S')}, took {time.time() - wait_start:.2f} seconds")
 
-    # Signal writer to finish
-    b_record_queue.put(None)  # Sentinel value to stop writer
-    write_future.result()  # Wait for writer to complete
+    # Signal writer to finish and wait
+    writer_should_stop = True
+    writer_thread.join()
+    print(f"Writer thread completed at {time.strftime('%H:%M:%S')}")
 
-print(f"Second Pass completed in {time.time() - start_time:.2f} seconds")
+print(f"Second Pass completed at {time.strftime('%H:%M:%S')}, took {time.time() - start_time:.2f} seconds")
 
 # Close all output files and exception log
+close_start = time.time()
+print(f"Starting file close at {time.strftime('%H:%M:%S')}")
 for file in output_files.values():
     file.close()
 exception_log.close()
+print(f"File close completed at {time.strftime('%H:%M:%S')}, took {time.time() - close_start:.2f} seconds")
 
 # Compute top-5 and bottom-5 purposes by absolute value
+stats_start = time.time()
+print(f"Starting stats computation at {time.strftime('%H:%M:%S')}")
 sorted_purposes = sorted(stats["expenditure_by_purpose"].items(), key=lambda x: abs(x[1]), reverse=True)
 top_5 = sorted_purposes[:5]
 bottom_5 = sorted_purposes[-5:] if len(sorted_purposes) >= 5 else sorted_purposes[:5]
@@ -273,6 +294,7 @@ for bin_key in range(0, 101, 10):
     range_str = f"{bin_key}-{min(bin_key + 9, 100)}" if bin_key < 100 else "100"
     print(f"| {range_str} | {count} |")
 
+print(f"Stats computation completed at {time.strftime('%H:%M:%S')}, took {time.time() - stats_start:.2f} seconds")
 print(f"Total execution time: {time.time() - start_time:.2f} seconds")
 print("\nProcessing complete. Output files created for each record type.")
 print("Exception log created: exception_log.txt")
